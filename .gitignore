@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Dataset
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+
+# Models
+models/*.joblib
+models/*.pkl
+models/*.txt
+!models/.gitkeep
+
+# Model checkpoints
+checkpoints/*.ckpt
+!checkpoints/.gitkeep
+
+# Editor
+.DS_Store
+.vscode/
