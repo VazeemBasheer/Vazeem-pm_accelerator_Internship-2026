@@ -2,7 +2,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+PROJECT_ROOT = _HERE.parent if _HERE.name == "src" else _HERE
 RAW_CSV = PROJECT_ROOT / "data" / "raw" / "Global Weather Repository.csv"
 RAW_PARQUET = PROJECT_ROOT / "data" / "interim" / "weather_raw.parquet"
 CLEAN_PARQUET = PROJECT_ROOT / "data" / "interim" / "weather_clean.parquet"
@@ -60,16 +61,21 @@ def standardize_panel(df: pd.DataFrame) -> pd.DataFrame:
     df["lat_round"] = df["latitude"].round(2)
     df["lon_round"] = df["longitude"].round(2)
 
+    # Merge city spelling variants using coordinate key
+    df["coord_key"] = df["lat_round"].astype(str) + "_" + df["lon_round"].astype(str)
+    df["location_name"] = df.groupby("coord_key")["location_name"].transform(lambda s: s.mode().iat[0])
+    df["country"] = df.groupby("coord_key")["country"].transform(lambda s: s.mode().iat[0])
+
     df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce")
-    df = df.dropna(subset=["last_updated", "location_name"])
+    df = df.dropna(subset=["last_updated", "coord_key"])
     df["date"] = df["last_updated"].dt.normalize()
     df["hour"] = df["last_updated"].dt.hour
 
     df = df.drop_duplicates()
     df["_hour_dist"] = (df["hour"] - 12).abs()
     df = (
-        df.sort_values(["location_name", "date", "_hour_dist", "last_updated"])
-        .drop_duplicates(subset=["location_name", "date"], keep="first")
+        df.sort_values(["coord_key", "date", "_hour_dist", "last_updated"])
+        .drop_duplicates(subset=["coord_key", "date"], keep="first")
         .drop(columns=["_hour_dist"])
     )
     return df
@@ -95,6 +101,9 @@ def engineer_structural_features(df: pd.DataFrame) -> pd.DataFrame:
     # Derive day length from sunrise/sunset and wind sine/cosine from wind_degree
     df = df.copy()
 
+    # Distance from equator for climate gradient features
+    df["abs_lat"] = df["latitude"].abs()
+
     if {"sunrise", "sunset"}.issubset(df.columns):
         sr_min = parse_clock_to_minutes(df["sunrise"])
         ss_min = parse_clock_to_minutes(df["sunset"])
@@ -115,8 +124,8 @@ def engineer_structural_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def validate(df: pd.DataFrame) -> None:
     # Assert unique city-date keys and valid physical bounds
-    dup_count = df.duplicated(subset=["location_name", "date"]).sum()
-    assert dup_count == 0, f"Found {dup_count} duplicate (location_name, date) rows."
+    dup_count = df.duplicated(subset=["coord_key", "date"]).sum()
+    assert dup_count == 0, f"Found {dup_count} duplicate (coord_key, date) rows."
 
     for col, (low, high) in PHYSICAL_BOUNDS.items():
         if col not in df.columns:
@@ -139,7 +148,7 @@ def main() -> None:
     missing_after = (df.isna().mean() * 100).round(2)
 
     df = engineer_structural_features(df)
-    df = df.sort_values(["location_name", "date"]).reset_index(drop=True)
+    df = df.sort_values(["coord_key", "date"]).reset_index(drop=True)
     validate(df)
 
     CLEAN_PARQUET.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +156,7 @@ def main() -> None:
 
     audit = pd.DataFrame({"missing_before_%": missing_before, "missing_after_%": missing_after})
     print(audit[audit["missing_after_%"] > 0])
-    print(f"\nSaved {len(df):,} clean rows across {df['location_name'].nunique()} cities to {CLEAN_PARQUET}")
+    print(f"\nSaved {len(df):,} clean rows across {df['coord_key'].nunique()} cities to {CLEAN_PARQUET}")
 
 
 if __name__ == "__main__":
