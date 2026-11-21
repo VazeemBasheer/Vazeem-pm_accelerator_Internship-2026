@@ -28,3 +28,7 @@ checkpoints/*.ckpt
 # Editor
 .DS_Store
 .vscode/
+
+# reports
+reports/figures/*
+!reports/figures/.gitkeep
