@@ -1,0 +1,58 @@
+{
+  "core": [
+    {
+      "section": "core",
+      "id": "temp_dist",
+      "title": "Temperature Distribution",
+      "path": "reports\\figures\\core\\temp_distribution.png"
+    },
+    {
+      "section": "core",
+      "id": "temp_time",
+      "title": "Temperature Over Time",
+      "path": "reports\\figures\\core\\temp_over_time.png"
+    },
+    {
+      "section": "core",
+      "id": "stl_decomp",
+      "title": "STL Decomposition (Abu Dhabi)",
+      "path": "reports\\figures\\core\\stl_decomposition.png"
+    },
+    {
+      "section": "core",
+      "id": "precip_patterns",
+      "title": "Precipitation Distribution & Seasonality",
+      "path": "reports\\figures\\core\\precip_patterns.png"
+    },
+    {
+      "section": "core",
+      "id": "acf_pacf",
+      "title": "Autocorrelation & Rain Drivers",
+      "path": "reports\\figures\\core\\autocorr_and_rain_signal.png"
+    }
+  ],
+  "advanced": [
+    {
+      "section": "advanced",
+      "id": "lat_gradient",
+      "title": "Global Latitude Temperature Gradient",
+      "path": "reports\\figures\\advanced\\latitude_gradient.png"
+    },
+    {
+      "section": "advanced",
+      "id": "aq_corr",
+      "title": "Air Quality & Weather Correlations",
+      "path": "reports\\figures\\advanced\\air_quality_weather_corr.png"
+    },
+    {
+      "section": "advanced",
+      "id": "anom_counts",
+      "title": "Extreme Weather Frequency",
+      "path": "reports\\figures\\advanced\\extreme_anomalies_by_continent.png"
+    }
+  ],
+  "tables": {
+    "core_summary": "data/processed/eda_core_summary.csv",
+    "advanced_city_geo": "data/processed/eda_advanced_city_geo.csv"
+  }
+}
