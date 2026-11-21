@@ -1,7 +1,7 @@
 [project]
 name = "weather-forcaster"
 version = "0.1.0"
-description = "Dependencies must be installed carefully"
+description = "Dependencies should be installed carefully"
 readme = "README.md"
 requires-python = ">=3.14.10"
 dependencies = [
