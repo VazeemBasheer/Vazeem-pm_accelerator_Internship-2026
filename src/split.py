@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold, TimeSeriesSplit
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+PROJECT_ROOT = _HERE.parent if _HERE.name == "src" else _HERE
 CLEAN_PARQUET = PROJECT_ROOT / "data" / "interim" / "weather_clean.parquet"
 SPLIT_PARQUET = PROJECT_ROOT / "data" / "interim" / "weather_split.parquet"
 
@@ -61,7 +62,8 @@ def iter_rolling_folds(train_df: pd.DataFrame, n_splits: int = N_SPLITS, gap: in
 def iter_city_folds(df: pd.DataFrame, n_splits: int = N_SPLITS):
     # Create city-grouped folds to test on unseen cities
     gkf = GroupKFold(n_splits=n_splits)
-    for tr_idx, va_idx in gkf.split(df, groups=df["location_name"]):
+    # Group by coordinate key to keep spelling variants together
+    for tr_idx, va_idx in gkf.split(df, groups=df["coord_key"]):
         yield df.iloc[tr_idx], df.iloc[va_idx]
 
 
