@@ -3,7 +3,7 @@ name = "weather-forcaster"
 version = "0.1.0"
 description = "Dependencies should be installed carefully"
 readme = "README.md"
-requires-python = ">=3.14.10"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "catboost>=1.2.10",
     "folium>=0.18.0",
