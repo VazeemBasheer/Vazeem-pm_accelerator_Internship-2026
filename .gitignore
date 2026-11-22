@@ -35,3 +35,10 @@ checkpoints/*.ckpt
 # reports
 reports/figures/*
 !reports/figures/.gitkeep
+
+# Catboost info
+catboost_info/
+
+# Logs
+logs/
+!logs/.gitkeep
