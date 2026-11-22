@@ -22,6 +22,8 @@ data/processed/*
 models/*.joblib
 models/*.pkl
 models/*.txt
+models/*.pt
+models/*.json
 !models/.gitkeep
 
 # Model checkpoints
