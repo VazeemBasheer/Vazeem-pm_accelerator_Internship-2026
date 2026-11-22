@@ -1,0 +1,2 @@
+coord_key,location_name,country,date,temperature_celsius,pred_temp_h1_c,pred_temp_h7_c,pred_precip_h1_mm,pred_precip_h7_mm,pred_rain_h1_prob,pred_rain_h1_label,pred_rain_h7_prob,pred_rain_h7_label
+28.6_77.2,New Delhi,India,2026-10-12,31.4,31.6898,31.49,0.0,0.0,0.0018,0,0.0056,0
