@@ -45,6 +45,12 @@ TARGETS = [
     "target_rain_h7",
 ]
 
+# Anchor columns used to transform temperature targets into climate/persistence residuals
+RESIDUAL_ANCHORS = {
+    "target_temp_h1": "temperature_celsius",
+    "target_temp_h7": "city_month_temp_clim",
+}
+
 FORBIDDEN_COLS = {
     "date",
     "split",
@@ -108,27 +114,38 @@ def infer_task(y: pd.Series, target: str) -> str:
     return "regression"
 
 
+def get_anchor_series(df: pd.DataFrame, target: str, fallback_mean: float) -> np.ndarray | None:
+    anchor_col = RESIDUAL_ANCHORS.get(target)
+    if anchor_col and anchor_col in df.columns:
+        return df[anchor_col].fillna(fallback_mean).to_numpy(dtype=np.float64)
+    return None
+
+
 def predict_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, target: str) -> np.ndarray:
+    fallback = float(train_df[target].mean())
     if "temp" in target:
-        if "h7" in target and "city_month_temp_clim" in eval_df.columns:
-            fallback = float(train_df[target].mean())
-            return eval_df["city_month_temp_clim"].fillna(fallback).to_numpy(dtype=np.float64)
-        if "temperature_celsius" in eval_df.columns:
-            fallback = float(train_df[target].mean())
-            return eval_df["temperature_celsius"].fillna(fallback).to_numpy(dtype=np.float64)
-        return np.full(len(eval_df), float(train_df[target].mean()), dtype=np.float64)
+        anchor = get_anchor_series(eval_df, target, fallback)
+        if anchor is not None:
+            return anchor
+        return np.full(len(eval_df), fallback, dtype=np.float64)
 
     if "precip" in target:
         if "precip_mm" in eval_df.columns:
             return eval_df["precip_mm"].fillna(0.0).to_numpy(dtype=np.float64)
-        return np.full(len(eval_df), float(train_df[target].mean()), dtype=np.float64)
+        return np.full(len(eval_df), fallback, dtype=np.float64)
 
-    rain_rate = float(train_df[target].mean())
-    return np.full(len(eval_df), rain_rate, dtype=np.float64)
+    return np.full(len(eval_df), fallback, dtype=np.float64)
 
 
-def build_estimator(model_name: str, task: str, parallel_mode: bool = False, use_gpu: bool = True):
+def build_estimator(
+    model_name: str,
+    task: str,
+    target: str,
+    parallel_mode: bool = False,
+    use_gpu: bool = True,
+):
     name = model_name.lower()
+    is_precip = "precip" in target.lower()
 
     if name == "linear":
         if task == "regression":
@@ -145,14 +162,20 @@ def build_estimator(model_name: str, task: str, parallel_mode: bool = False, use
 
     if name == "histgb":
         if task == "regression":
-            return HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, random_state=42)
+            # Use L1 loss for both temperature residuals and zero-inflated precipitation
+            return HistGradientBoostingRegressor(
+                loss="absolute_error",
+                max_iter=350,
+                learning_rate=0.05,
+                random_state=42,
+            )
         return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=42)
 
     if name == "lgbm":
         from lightgbm import LGBMClassifier, LGBMRegressor
         n_jobs = 4 if parallel_mode else -1
         params = dict(
-            n_estimators=300,
+            n_estimators=350,
             learning_rate=0.05,
             num_leaves=31,
             subsample_for_bin=50000,
@@ -160,17 +183,27 @@ def build_estimator(model_name: str, task: str, parallel_mode: bool = False, use
             n_jobs=n_jobs,
             verbose=-1,
         )
-        return LGBMRegressor(**params) if task == "regression" else LGBMClassifier(**params)
+        if task == "classification":
+            return LGBMClassifier(**params)
+        if is_precip:
+            params["objective"] = "tweedie"
+            params["tweedie_variance_power"] = 1.5
+        else:
+            params["objective"] = "regression_l1"
+        return LGBMRegressor(**params)
 
     if name == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
         params = dict(
-            iterations=400,
+            iterations=450,
             learning_rate=0.05,
             depth=6,
             random_seed=42,
             verbose=0,
         )
+        if task == "regression":
+            params["loss_function"] = "Tweedie:variance_power=1.5" if is_precip else "MAE"
+
         if use_gpu:
             params["task_type"] = "GPU"
             params["gpu_ram_part"] = 0.30 if parallel_mode else 0.70
@@ -213,46 +246,68 @@ def fit_and_eval_one(
     verify_no_leakage(tr_df, ev_df, features, target)
 
     task = infer_task(tr_df[target], target)
-    y_train = tr_df[target].to_numpy()
-    y_eval = ev_df[target].to_numpy()
+    y_train_raw = tr_df[target].to_numpy(dtype=np.float64)
+    y_eval_raw = ev_df[target].to_numpy(dtype=np.float64)
+
+    anchor_col = RESIDUAL_ANCHORS.get(target)
+    train_mean = float(np.mean(y_train_raw))
+    train_anchor = get_anchor_series(tr_df, target, train_mean)
+    eval_anchor = get_anchor_series(ev_df, target, train_mean)
+    use_residual = (anchor_col is not None) and (train_anchor is not None) and (eval_anchor is not None)
 
     if model_name == "baseline":
         preds = predict_baseline(tr_df, ev_df, target)
     else:
         X_train = tr_df[features]
         X_eval = ev_df[features]
+        y_fit = (y_train_raw - train_anchor) if use_residual else y_train_raw
 
         if model_name == "catboost":
             try:
-                est = build_estimator(model_name, task, parallel_mode=parallel_mode, use_gpu=True)
-                est.fit(X_train, y_train)
+                est = build_estimator(model_name, task, target, parallel_mode=parallel_mode, use_gpu=True)
+                est.fit(X_train, y_fit)
             except Exception:
-                est = build_estimator(model_name, task, parallel_mode=parallel_mode, use_gpu=False)
-                est.fit(X_train, y_train)
+                est = build_estimator(model_name, task, target, parallel_mode=parallel_mode, use_gpu=False)
+                est.fit(X_train, y_fit)
         else:
-            est = build_estimator(model_name, task, parallel_mode=parallel_mode)
-            est.fit(X_train, y_train)
+            est = build_estimator(model_name, task, target, parallel_mode=parallel_mode)
+            est.fit(X_train, y_fit)
 
-        preds = (
+        raw_preds = (
             est.predict_proba(X_eval)[:, 1]
             if task == "classification"
             else est.predict(X_eval)
         )
 
+        # Reconstruct temperature from predicted residual delta; enforce non-negativity on precipitation
+        if use_residual:
+            preds = raw_preds + eval_anchor
+        elif "precip" in target.lower():
+            preds = np.clip(raw_preds, 0.0, None)
+        else:
+            preds = raw_preds
+
         if not dry_run:
             MODEL_DIR.mkdir(parents=True, exist_ok=True)
             joblib.dump(
-                {"model": est, "features": features, "target": target, "task": task},
+                {
+                    "model": est,
+                    "features": features,
+                    "target": target,
+                    "task": task,
+                    "residual_anchor": anchor_col if use_residual else None,
+                    "fallback_mean": train_mean,
+                },
                 MODEL_DIR / f"{target}_{model_name}.joblib",
             )
 
-    metrics = evaluate_predictions(y_eval, preds, task)
+    metrics = evaluate_predictions(y_eval_raw, preds, task)
 
     if not dry_run:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         meta_cols = [c for c in ["coord_key", "location_name", "country", "date"] if c in ev_df.columns]
         out_df = ev_df[meta_cols].copy()
-        out_df["actual"] = y_eval
+        out_df["actual"] = y_eval_raw
         out_df["predicted"] = preds
         out_df.to_parquet(OUTPUT_DIR / f"preds_{target}_{model_name}_{eval_split}.parquet", index=False)
 
@@ -261,6 +316,7 @@ def fit_and_eval_one(
         "model": model_name,
         "target": target,
         "task": task,
+        "residual_mode": use_residual,
         "features": len(features),
         "train_rows": len(tr_df),
         "eval_rows": len(ev_df),
@@ -278,17 +334,20 @@ def prepare_slice(
     model_name: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     meta_cols = [c for c in ["coord_key", "location_name", "country", "date"] if c in df.columns]
-    baseline_cols = [c for c in ["temperature_celsius", "precip_mm", "city_month_temp_clim"] if c in df.columns]
-    extra = baseline_cols if model_name == "baseline" else []
-    keep_cols = list(dict.fromkeys(meta_cols + features + extra + [target]))
+    extra_cols = []
+    if target in RESIDUAL_ANCHORS and RESIDUAL_ANCHORS[target] in df.columns:
+        extra_cols.append(RESIDUAL_ANCHORS[target])
+    if model_name == "baseline":
+        extra_cols.extend([c for c in ["temperature_celsius", "precip_mm", "city_month_temp_clim"] if c in df.columns])
 
+    keep_cols = list(dict.fromkeys(meta_cols + features + extra_cols + [target]))
     tr_slice = df.loc[train_mask & df[target].notna(), keep_cols].copy()
     ev_slice = df.loc[eval_mask & df[target].notna(), keep_cols].copy()
     return tr_slice, ev_slice
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Leak-proof overnight benchmark runner.")
+    parser = argparse.ArgumentParser(description="Leak-proof benchmark runner with residual temp & Tweedie/L1 precip.")
     parser.add_argument("--eval-split", type=str, default="valid", choices=["valid", "test"], help="Evaluation split")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA, help="Path to feature parquet")
     parser.add_argument("--selected", type=Path, default=DEFAULT_SELECTED, help="Path to selected_features.csv")
@@ -300,7 +359,7 @@ def main() -> None:
     args = parser.parse_args()
 
     t_total = time.perf_counter()
-    log(f"=== Starting Overnight Benchmark Run (split={args.eval_split}, dry_run={args.dry_run}) ===")
+    log(f"=== Starting Benchmark Run (split={args.eval_split}, dry_run={args.dry_run}) ===")
 
     df = load_dataset(args.data)
     if args.dry_run:
@@ -319,7 +378,8 @@ def main() -> None:
 
     target_features = {t: get_feature_list(args.selected, t, df) for t in available_targets}
     for t, feats in target_features.items():
-        log(f"Loaded feature schema | {t:18s}: {len(feats)} features -> {feats}")
+        anchor_note = f" | anchor={RESIDUAL_ANCHORS[t]}" if t in RESIDUAL_ANCHORS else ""
+        log(f"Loaded feature schema | {t:18s}: {len(feats)} features{anchor_note}")
 
     model_schedule = [
         ("baseline", "sequential"),
@@ -375,7 +435,7 @@ def main() -> None:
         gc.collect()
 
     elapsed_min = (time.perf_counter() - t_total) / 60.0
-    log(f"=== Overnight Run Complete in {elapsed_min:.2f} mins ({len(all_rows)} runs completed) ===")
+    log(f"=== Run Complete in {elapsed_min:.2f} mins ({len(all_rows)} runs completed) ===")
     if args.dry_run:
         log("Dry run finished (no models, predictions, or leaderboard files were written).")
     else:
