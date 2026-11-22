@@ -21,6 +21,7 @@ from sklearn.metrics import (
     roc_auc_score,
     root_mean_squared_error,
 )
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
@@ -34,7 +35,6 @@ DEFAULT_SELECTED = PROJECT_ROOT / "data" / "processed" / "selected_features.csv"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
 MODEL_DIR = PROJECT_ROOT / "models"
 LOG_FILE = PROJECT_ROOT / "logs" / "overnight_train.log"
-LEADERBOARD_CSV = OUTPUT_DIR / "benchmark_leaderboard.csv"
 
 TARGETS = [
     "target_temp_h1",
@@ -45,11 +45,14 @@ TARGETS = [
     "target_rain_h7",
 ]
 
-# Anchor columns used to transform temperature targets into climate/persistence residuals
 RESIDUAL_ANCHORS = {
     "target_temp_h1": "temperature_celsius",
     "target_temp_h7": "city_month_temp_clim",
 }
+
+# Tree models train on 5-fold date-grouped OOF Ridge residuals for these targets
+HYBRID_RIDGE_TARGETS = {"target_temp_h7"}
+TREE_MODELS = {"histgb", "lgbm", "catboost"}
 
 FORBIDDEN_COLS = {
     "date",
@@ -94,7 +97,6 @@ def verify_no_leakage(train_df: pd.DataFrame, eval_df: pd.DataFrame, features: l
     leaked_cols = [c for c in features if c in FORBIDDEN_COLS or c.startswith("target_")]
     if leaked_cols:
         raise RuntimeError(f"Leakage detected in feature list for {target}: {leaked_cols}")
-
     if len(train_df.index.intersection(eval_df.index)) > 0:
         raise RuntimeError("Index overlap detected between train and eval splits.")
 
@@ -148,6 +150,38 @@ def predict_baseline(train_df: pd.DataFrame, eval_df: pd.DataFrame, target: str)
     return np.full(len(eval_df), fallback, dtype=np.float64)
 
 
+def make_ridge_pipeline() -> Pipeline:
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("scale", RobustScaler()),
+        ("model", Ridge(alpha=1.0)),
+    ])
+
+
+def fit_oof_ridge_stage(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_eval: pd.DataFrame,
+    dates: pd.Series | None,
+) -> tuple[np.ndarray, np.ndarray, Pipeline]:
+    """Fits leak-free 5-fold date-grouped OOF Ridge on train + full Ridge for eval."""
+    oof_preds = np.zeros(len(X_train), dtype=np.float64)
+    if dates is not None and dates.nunique() >= 5:
+        splitter = GroupKFold(n_splits=5).split(X_train, y_train, groups=dates)
+    else:
+        splitter = KFold(n_splits=5, shuffle=True, random_state=42).split(X_train)
+
+    for tr_idx, va_idx in splitter:
+        fold_ridge = make_ridge_pipeline()
+        fold_ridge.fit(X_train.iloc[tr_idx], y_train[tr_idx])
+        oof_preds[va_idx] = fold_ridge.predict(X_train.iloc[va_idx])
+
+    full_ridge = make_ridge_pipeline()
+    full_ridge.fit(X_train, y_train)
+    eval_preds = full_ridge.predict(X_eval)
+    return oof_preds, eval_preds, full_ridge
+
+
 def build_estimator(
     model_name: str,
     task: str,
@@ -160,11 +194,7 @@ def build_estimator(
 
     if name == "linear":
         if task == "regression":
-            return Pipeline([
-                ("imp", SimpleImputer(strategy="median")),
-                ("scale", RobustScaler()),
-                ("model", Ridge(alpha=1.0)),
-            ])
+            return make_ridge_pipeline()
         return Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scale", RobustScaler()),
@@ -265,6 +295,7 @@ def fit_and_eval_one(
     train_anchor = get_anchor_series(tr_df, target, train_mean)
     eval_anchor = get_anchor_series(ev_df, target, train_mean)
     use_residual = (anchor_col is not None) and (train_anchor is not None) and (eval_anchor is not None)
+    use_hybrid_ridge = (target in HYBRID_RIDGE_TARGETS) and (model_name in TREE_MODELS) and use_residual
 
     if model_name == "baseline":
         preds = predict_baseline(tr_df, ev_df, target)
@@ -272,6 +303,13 @@ def fit_and_eval_one(
         X_train = tr_df[features]
         X_eval = ev_df[features]
         y_fit = (y_train_raw - train_anchor) if use_residual else y_train_raw
+
+        ridge_stage = None
+        ridge_eval_offset = 0.0
+        if use_hybrid_ridge:
+            dates = tr_df["date"] if "date" in tr_df.columns else None
+            ridge_oof, ridge_eval_offset, ridge_stage = fit_oof_ridge_stage(X_train, y_fit, X_eval, dates)
+            y_fit = y_fit - ridge_oof
 
         if model_name == "catboost":
             try:
@@ -291,7 +329,7 @@ def fit_and_eval_one(
         )
 
         if use_residual:
-            preds = raw_preds + eval_anchor
+            preds = raw_preds + ridge_eval_offset + eval_anchor
         elif "precip" in target.lower():
             preds = np.clip(raw_preds, 0.0, None)
         else:
@@ -302,6 +340,7 @@ def fit_and_eval_one(
             joblib.dump(
                 {
                     "model": est,
+                    "ridge_stage": ridge_stage,
                     "features": features,
                     "target": target,
                     "task": task,
@@ -357,16 +396,16 @@ def prepare_slice(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Leak-proof benchmark runner with residual temp & Tweedie/L1 precip.")
-    parser.add_argument("--eval-split", type=str, default="valid", choices=["valid", "test"], help="Evaluation split")
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA, help="Path to feature parquet")
-    parser.add_argument("--selected", type=Path, default=DEFAULT_SELECTED, help="Path to selected_features.csv")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run on a 2,000-row subset per split without writing models, predictions, or leaderboard files",
-    )
+    parser = argparse.ArgumentParser(description="Leak-proof benchmark runner with hybrid Ridge+Tree temp_h7.")
+    parser.add_argument("--eval-split", type=str, default="valid", choices=["valid", "test"])
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--selected", type=Path, default=DEFAULT_SELECTED)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    leaderboard_csv = OUTPUT_DIR / (
+        "benchmark_leaderboard.csv" if args.eval_split == "valid" else f"{args.eval_split}_leaderboard.csv"
+    )
 
     t_total = time.perf_counter()
     log(f"=== Starting Benchmark Run (split={args.eval_split}, dry_run={args.dry_run}, has_gpu={HAS_GPU}) ===")
@@ -383,13 +422,10 @@ def main() -> None:
         raise ValueError(f"Empty split detected: train={train_mask.sum()}, {args.eval_split}={eval_mask.sum()}")
 
     available_targets = [t for t in TARGETS if t in df.columns]
-    if not available_targets:
-        raise KeyError(f"None of expected targets {TARGETS} found in dataset.")
-
     target_features = {t: get_feature_list(args.selected, t, df) for t in available_targets}
     for t, feats in target_features.items():
-        anchor_note = f" | anchor={RESIDUAL_ANCHORS[t]}" if t in RESIDUAL_ANCHORS else ""
-        log(f"Loaded feature schema | {t:18s}: {len(feats)} features{anchor_note}")
+        hybrid_note = " | hybrid_ridge=True" if t in HYBRID_RIDGE_TARGETS else ""
+        log(f"Loaded feature schema | {t:18s}: {len(feats)} features{hybrid_note}")
 
     model_schedule = [
         ("baseline", "sequential"),
@@ -408,14 +444,8 @@ def main() -> None:
                     feats = target_features[target]
                     tr_slice, ev_slice = prepare_slice(df, train_mask, eval_mask, target, feats, model_name)
                     row = fit_and_eval_one(
-                        target,
-                        model_name,
-                        args.eval_split,
-                        feats,
-                        tr_slice,
-                        ev_slice,
-                        parallel_mode=False,
-                        dry_run=args.dry_run,
+                        target, model_name, args.eval_split, feats, tr_slice, ev_slice,
+                        parallel_mode=False, dry_run=args.dry_run,
                     )
                     all_rows.append(row)
                     log(f"  {model_name:8s} | {target:18s} | {row}")
@@ -435,8 +465,15 @@ def main() -> None:
                         log(f"  {model_name:8s} | {row['target']:18s} | {row}")
 
             if not args.dry_run:
-                board_df = pd.DataFrame(all_rows).sort_values(["target", "model"]).reset_index(drop=True)
-                board_df.to_csv(LEADERBOARD_CSV, index=False)
+                new_df = pd.DataFrame(all_rows)
+                if leaderboard_csv.exists():
+                    old_df = pd.read_csv(leaderboard_csv)
+                    old_df = old_df[~old_df["model"].isin(new_df["model"].unique())]
+                    board_df = pd.concat([old_df, new_df], ignore_index=True)
+                else:
+                    board_df = new_df
+                board_df = board_df.sort_values(["target", "model"]).reset_index(drop=True)
+                board_df.to_csv(leaderboard_csv, index=False)
 
         except Exception as exc:
             log(f"ERROR in model family '{model_name}': {exc}")
@@ -446,10 +483,8 @@ def main() -> None:
 
     elapsed_min = (time.perf_counter() - t_total) / 60.0
     log(f"=== Run Complete in {elapsed_min:.2f} mins ({len(all_rows)} runs completed) ===")
-    if args.dry_run:
-        log("Dry run finished (no models, predictions, or leaderboard files were written).")
-    else:
-        log(f"Leaderboard saved to: {LEADERBOARD_CSV}")
+    if not args.dry_run:
+        log(f"Leaderboard saved to: {leaderboard_csv}")
 
 
 if __name__ == "__main__":
