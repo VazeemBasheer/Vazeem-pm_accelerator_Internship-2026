@@ -61,6 +61,17 @@ FORBIDDEN_COLS = {
 }
 
 
+def detect_gpu() -> bool:
+    try:
+        from catboost.utils import get_gpu_device_count
+        return get_gpu_device_count() > 0
+    except Exception:
+        return False
+
+
+HAS_GPU = detect_gpu()
+
+
 def log(msg: str) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
@@ -162,7 +173,6 @@ def build_estimator(
 
     if name == "histgb":
         if task == "regression":
-            # Use L1 loss for both temperature residuals and zero-inflated precipitation
             return HistGradientBoostingRegressor(
                 loss="absolute_error",
                 max_iter=350,
@@ -207,6 +217,7 @@ def build_estimator(
         if use_gpu:
             params["task_type"] = "GPU"
             params["gpu_ram_part"] = 0.30 if parallel_mode else 0.70
+            params["metric_period"] = 5
         else:
             params["task_type"] = "CPU"
             params["thread_count"] = 4 if parallel_mode else -1
@@ -264,7 +275,7 @@ def fit_and_eval_one(
 
         if model_name == "catboost":
             try:
-                est = build_estimator(model_name, task, target, parallel_mode=parallel_mode, use_gpu=True)
+                est = build_estimator(model_name, task, target, parallel_mode=parallel_mode, use_gpu=HAS_GPU)
                 est.fit(X_train, y_fit)
             except Exception:
                 est = build_estimator(model_name, task, target, parallel_mode=parallel_mode, use_gpu=False)
@@ -279,7 +290,6 @@ def fit_and_eval_one(
             else est.predict(X_eval)
         )
 
-        # Reconstruct temperature from predicted residual delta; enforce non-negativity on precipitation
         if use_residual:
             preds = raw_preds + eval_anchor
         elif "precip" in target.lower():
@@ -359,7 +369,7 @@ def main() -> None:
     args = parser.parse_args()
 
     t_total = time.perf_counter()
-    log(f"=== Starting Benchmark Run (split={args.eval_split}, dry_run={args.dry_run}) ===")
+    log(f"=== Starting Benchmark Run (split={args.eval_split}, dry_run={args.dry_run}, has_gpu={HAS_GPU}) ===")
 
     df = load_dataset(args.data)
     if args.dry_run:
@@ -416,7 +426,7 @@ def main() -> None:
                     tr_slice, ev_slice = prepare_slice(df, train_mask, eval_mask, target, feats, model_name)
                     tasks.append((target, model_name, args.eval_split, feats, tr_slice, ev_slice, True, args.dry_run))
 
-                workers = 2 if model_name == "catboost" else 3
+                workers = 2 if (model_name == "catboost" and HAS_GPU) else 3
                 with ProcessPoolExecutor(max_workers=workers) as pool:
                     futures = [pool.submit(fit_and_eval_one, *t) for t in tasks]
                     for fut in as_completed(futures):
